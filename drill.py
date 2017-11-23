@@ -164,12 +164,17 @@ def main():
         ptrace(PTRACE_DETACH, pid)
 
     totals = sorted(((size * count, count, name) for name, size, count in types), reverse=True)
-    maxcount = max(count for total, count, name in totals)
+    sumtotal = sum(total for total, count, name in totals)
+    sumcount = sum(count for total, count, name in totals)
 
-    fmt = "{:>" + str(len(str(totals[0][0]))) + "} {:>" + str(len(str(maxcount))) + "} {}"
+    fmt = "{:>" + str(len(str(sumcount))) + "} {:>" + str(len(str(sumtotal))) + "}"
+
+    print(fmt.format("COUNT", "MEMORY"))
+    print(fmt.format(sumcount, sumtotal), "100%")
+    print()
 
     for total, count, name in totals:
-        print(fmt.format(total, count, name))
+        print(fmt.format(count, total), "{:3}%".format(100 * total // sumtotal), name)
 
 
 if __name__ == "__main__":
