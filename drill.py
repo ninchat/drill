@@ -6,7 +6,7 @@ import struct
 import sys
 from collections import defaultdict
 from ctypes import CDLL, c_int, c_long, c_size_t, c_ssize_t, c_void_p, sizeof
-from mmap import MAP_PRIVATE, PROT_READ, mmap
+from os.path import realpath
 
 NUM_GENERATIONS = 3
 
@@ -15,11 +15,13 @@ PTRACE_DETACH = 17
 
 BLOCK_SIZE = 4096
 
-p_size = sizeof(c_void_p)
-p_pack = {4: "I", 8: "Q"}[p_size]
+ptr_size = sizeof(c_void_p)
+ptr_pack = {4: "I", 8: "Q"}[ptr_size]
+
+ssize_size = sizeof(c_void_p)
+ssize_pack = {4: "i", 8: "q"}[ssize_size]
 
 libc = CDLL("libc.so.6")
-
 libc.ptrace.argtypes = [c_int, c_int, c_void_p, c_void_p]
 libc.ptrace.restype = c_long
 
@@ -29,54 +31,32 @@ def ptrace(request, pid):
         raise Exception("ptrace")
 
 
-class MemoryMap:
+class LazyMemory:
 
-    def __init__(self, *args, **kwargs):
-        self._mmap = mmap(*args, **kwargs)
-
-    def slice(self, offset):
-        return self._mmap[offset:]
-
-    def close(self):
-        self._mmap.close()
-
-
-class ReadMemory:
-
-    def __init__(self, fil, offset):
-        self._file = fil  # Borrowed reference
-        self._base = offset
+    def __init__(self, pid):
         self._blocks = {}
+        self._file = open("/proc/{}/mem".format(pid), "rb")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._file.close()
 
     def slice(self, offset):
         block_offset = offset & ~(BLOCK_SIZE - 1)
         try:
             b = self._blocks[block_offset]
         except KeyError:
-            self._file.seek(self._base + block_offset)
+            self._file.seek(block_offset)
             b = self._blocks[block_offset] = self._file.read(BLOCK_SIZE)
         return b[offset & (BLOCK_SIZE - 1):]
 
-    def close(self):
-        pass
-
-
-class Memory:
-
-    def __init__(self, maps):
-        self._maps = maps
-
-    def slice(self, offset):
-        for start, end, m in self._maps:
-            if offset >= start and offset < end:
-                return m.slice(offset - start)
-        raise Exception("Data address 0x%x not mapped" % offset)
-
     def ptr(self, offset):
-        return struct.unpack(p_pack, self.slice(offset)[:p_size])[0]
+        return struct.unpack(ptr_pack, self.slice(offset)[:ptr_size])[0]
 
-    def int32(self, offset):
-        return struct.unpack("i", self.slice(offset)[:4])[0]
+    def ssize(self, offset):
+        return struct.unpack(ssize_pack, self.slice(offset)[:ssize_size])[0]
 
     def str(self, offset):
         b = bytearray()
@@ -91,8 +71,8 @@ class Memory:
 
 
 offset_gc_head_next = 0
-offset_gc_head_prev = offset_gc_head_next + p_size
-offset_gc_head_refs = offset_gc_head_prev + p_size
+offset_gc_head_prev = offset_gc_head_next + ptr_size
+offset_gc_head_refs = offset_gc_head_prev + ptr_size
 sizeof_gc_head = offset_gc_head_refs + sizeof(c_ssize_t)
 
 offset_gc_generation_head = 0
@@ -102,7 +82,7 @@ sizeof_gc_generation = offset_gc_generation_count + sizeof(c_int)
 
 offset_object_refcnt = 0
 offset_object_type = offset_object_refcnt + sizeof(c_ssize_t)
-sizeof_object = offset_object_type + p_size
+sizeof_object = offset_object_type + ptr_size
 
 offset_var_object_base = 0
 offset_var_object_size = offset_var_object_base + sizeof_object
@@ -110,10 +90,11 @@ sizeof_var_object = offset_var_object_size + sizeof(c_ssize_t)
 
 offset_typeobject_head = 0
 offset_typeobject_name = offset_typeobject_head + sizeof_var_object
+offset_typeobject_basicsize = offset_typeobject_name + ptr_size
 
 
 def drill(mem, gen0_offset):
-    type_names = {}
+    type_names_sizes = {}
     type_counts = defaultdict(int)
 
     gc_list = mem.ptr(gen0_offset)
@@ -122,28 +103,50 @@ def drill(mem, gen0_offset):
         gc = mem.ptr(gc_list + offset_gc_head_next)
         while gc != gc_list:
             op = gc + sizeof_gc_head
-            typ = mem.ptr(op + offset_object_type)
-            type_counts[typ] += 1
+            t = mem.ptr(op + offset_object_type)
+            type_counts[t] += 1
 
-            if typ not in type_names:
-                name_ptr = mem.ptr(typ + offset_typeobject_name)
-                type_names[typ] = mem.str(name_ptr)
+            if t not in type_names_sizes:
+                name = mem.str(mem.ptr(t + offset_typeobject_name))
+                size = mem.ssize(t + offset_typeobject_basicsize)
+                type_names_sizes[t] = [name, sizeof_gc_head + size]
 
             gc = mem.ptr(gc + offset_gc_head_next)
 
         gc_list += sizeof_gc_generation
 
-    return sorted(((cnt, type_names[typ]) for typ, cnt in type_counts.items()), reverse=True)
+    return (type_names_sizes[t] + [count] for t, count in type_counts.items())
+
+
+def adjust_addr(pid, pathname, disp, addr):
+    maps = "/proc/{}/maps".format(pid)
+
+    with open(maps) as f:
+        for line in f:
+            fields = line.strip().split()
+
+            if len(fields) > 5 and fields[5] == pathname:
+                start, end = (int(x, 16) for x in fields[0].split("-", 1))
+                offset = int(fields[2], 16)
+
+                if addr >= disp + offset and addr < disp + offset + (end - start):
+                    return start + addr - (disp + offset)
+
+    raise Exception("Data address 0x{:x} mapped from {} not found in {}".format(addr, pathname, maps))
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--_PyGC_generation0", type=str)
-    parser.add_argument("pid", type=int, help="Python process id to drill")
+    parser.add_argument("--python", metavar="BINARY", type=str, default=realpath(sys.executable))
+    parser.add_argument("data_address", type=str, help=".data section address in Python binary")
+    parser.add_argument("data_offset", type=str, help=".data section offset in Python binary")
+    parser.add_argument("gen0_address", type=str, help="_PyGC_generation0 symbol address in Python binary")
+    parser.add_argument("pid", type=int, help="Python process id")
     args = parser.parse_args()
 
+    data_disp = int(args.data_address, 0) - int(args.data_offset, 0)
+    gen0_addr = int(args.gen0_address, 0)
     pid = args.pid
-    gen0_offset = int(args._PyGC_generation0, 0)
 
     ptrace(PTRACE_ATTACH, pid)
     try:
@@ -153,44 +156,20 @@ def main():
         if not os.WIFSTOPPED(status):
             raise Exception("Process {} did not stop".format(pid))
 
-        try:
-            with open("/proc/{}/mem".format(pid), "rb") as memfile:
-                maps = []
+        proc_gen0_addr = adjust_addr(pid, args.python, data_disp, gen0_addr)
 
-                with open("/proc/{}/maps".format(pid)) as mapsfile:
-                    for line in mapsfile:
-                        fields = line.split()
-                        start, end = (int(x, 16) for x in fields[0].split("-", 1))
-                        perms = fields[1]
-
-                        if "r" in perms:
-                            length = end - start
-
-                            if "w" not in perms and len(fields) > 5 and fields[5].startswith("/"):
-                                offset = int(fields[2], 16)
-                                pathname = fields[5]
-
-                                fd = os.open(pathname, os.O_RDONLY)
-                                try:
-                                    m = MemoryMap(fd, 0, MAP_PRIVATE, PROT_READ, offset=offset)
-                                finally:
-                                    os.close(fd)
-                            else:
-                                m = ReadMemory(memfile, start)
-
-                            maps.append((start, end, m))
-
-                count_types = drill(Memory(maps), gen0_offset)
-        finally:
-            for start, end, m in maps:
-                m.close()
+        with LazyMemory(pid) as mem:
+            types = drill(mem, proc_gen0_addr)
     finally:
         ptrace(PTRACE_DETACH, pid)
 
-    width = len(str(count_types[0][0]))
+    totals = sorted(((size * count, count, name) for name, size, count in types), reverse=True)
+    maxcount = max(count for total, count, name in totals)
 
-    for cnt, name in count_types:
-        print(("%" + str(width) + "d %s") % (cnt, name))
+    fmt = "{:>" + str(len(str(totals[0][0]))) + "} {:>" + str(len(str(maxcount))) + "} {}"
+
+    for total, count, name in totals:
+        print(fmt.format(total, count, name))
 
 
 if __name__ == "__main__":
