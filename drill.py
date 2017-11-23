@@ -18,7 +18,7 @@ BLOCK_SIZE = 4096
 ptr_size = sizeof(c_void_p)
 ptr_pack = {4: "I", 8: "Q"}[ptr_size]
 
-ssize_size = sizeof(c_void_p)
+ssize_size = sizeof(c_ssize_t)
 ssize_pack = {4: "i", 8: "q"}[ssize_size]
 
 libc = CDLL("libc.so.6")
@@ -73,7 +73,7 @@ class LazyMemory:
 offset_gc_head_next = 0
 offset_gc_head_prev = offset_gc_head_next + ptr_size
 offset_gc_head_refs = offset_gc_head_prev + ptr_size
-sizeof_gc_head = offset_gc_head_refs + sizeof(c_ssize_t)
+sizeof_gc_head = offset_gc_head_refs + ssize_size
 
 offset_gc_generation_head = 0
 offset_gc_generation_threshold = offset_gc_generation_head + sizeof_gc_head
@@ -81,21 +81,23 @@ offset_gc_generation_count = offset_gc_generation_threshold + sizeof(c_int)
 sizeof_gc_generation = offset_gc_generation_count + sizeof(c_int)
 
 offset_object_refcnt = 0
-offset_object_type = offset_object_refcnt + sizeof(c_ssize_t)
+offset_object_type = offset_object_refcnt + ssize_size
 sizeof_object = offset_object_type + ptr_size
 
 offset_var_object_base = 0
 offset_var_object_size = offset_var_object_base + sizeof_object
-sizeof_var_object = offset_var_object_size + sizeof(c_ssize_t)
+sizeof_var_object = offset_var_object_size + ssize_size
 
 offset_typeobject_head = 0
 offset_typeobject_name = offset_typeobject_head + sizeof_var_object
 offset_typeobject_basicsize = offset_typeobject_name + ptr_size
+offset_typeobject_itemsize = offset_typeobject_basicsize + ssize_size
 
 
 def drill(mem, gen0_offset):
-    type_names_sizes = {}
+    type_names = {}
     type_counts = defaultdict(int)
+    type_sizes = defaultdict(int)
 
     gc_list = mem.ptr(gen0_offset)
 
@@ -103,19 +105,26 @@ def drill(mem, gen0_offset):
         gc = mem.ptr(gc_list + offset_gc_head_next)
         while gc != gc_list:
             op = gc + sizeof_gc_head
+
             t = mem.ptr(op + offset_object_type)
             type_counts[t] += 1
 
-            if t not in type_names_sizes:
-                name = mem.str(mem.ptr(t + offset_typeobject_name))
-                size = mem.ssize(t + offset_typeobject_basicsize)
-                type_names_sizes[t] = [name, sizeof_gc_head + size]
+            if t not in type_names:
+                type_names[t] = mem.str(mem.ptr(t + offset_typeobject_name))
+
+            basicsize = mem.ssize(t + offset_typeobject_basicsize)
+            itemsize = mem.ssize(t + offset_typeobject_itemsize)
+            if itemsize > 0:
+                varsize = itemsize * mem.ssize(op + offset_var_object_size)
+            else:
+                varsize = 0
+            type_sizes[t] += sizeof_gc_head + basicsize + varsize
 
             gc = mem.ptr(gc + offset_gc_head_next)
 
         gc_list += sizeof_gc_generation
 
-    return (type_names_sizes[t] + [count] for t, count in type_counts.items())
+    return ((type_sizes[t], count, type_names[t]) for t, count in type_counts.items())
 
 
 def adjust_addr(pid, pathname, disp, addr):
@@ -163,18 +172,18 @@ def main():
     finally:
         ptrace(PTRACE_DETACH, pid)
 
-    totals = sorted(((size * count, count, name) for name, size, count in types), reverse=True)
-    sumtotal = sum(total for total, count, name in totals)
-    sumcount = sum(count for total, count, name in totals)
+    types = sorted(types, reverse=True)
+    sumsize = sum(size for size, count, name in types)
+    sumcount = sum(count for size, count, name in types)
 
-    fmt = "{:>" + str(len(str(sumcount))) + "} {:>" + str(len(str(sumtotal))) + "}"
+    fmt = "{:>" + str(len(str(sumcount))) + "} {:>" + str(len(str(sumsize))) + "}"
 
     print(fmt.format("COUNT", "MEMORY"))
-    print(fmt.format(sumcount, sumtotal), "100%")
+    print(fmt.format(sumcount, sumsize), "100%")
     print()
 
-    for total, count, name in totals:
-        print(fmt.format(count, total), "{:3}%".format(100 * total // sumtotal), name)
+    for size, count, name in types:
+        print(fmt.format(count, size), "{:3}%".format(100 * size // sumsize), name)
 
 
 if __name__ == "__main__":
